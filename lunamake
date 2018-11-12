@@ -1,0 +1,216 @@
+#!/usr/bin/python3
+
+import argparse
+import collections
+import logging
+import os
+import pprint
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+def main():
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-C", '--directory', metavar="DIRECTORY", 
+            help="directory containing lunamake configuration files (default current)")
+    parser.add_argument("-l", '--log', metavar="LOG_LEVEL", default="INFO",
+            help="log level name as defined in python logging module")
+    parser.add_argument("-n", '--noop', action="store_true",
+            help="do not modify any files outside of DIRECTORY")
+    parser.add_argument('targets', metavar="TARGETS", nargs='*')
+    args = parser.parse_args()
+
+    # change to config directory
+    if args.directory:
+        os.chdir(args.directory)
+
+    log_level = getattr(logging, args.log.upper(), None)
+    logging.basicConfig(level=log_level)
+
+    while True:
+
+        # parse .conf file(s) 
+        files = sorted(filter(lambda fn: fn.endswith(".conf"), os.listdir()))
+        conf = Config(files)
+        logging.debug(pprint.pformat(conf))
+        # default = conf.default()
+
+        # set environment vars
+        env = Env()
+        env.LM_DIR = os.path.abspath('.')
+        env.LM_STAMPDIR = os.path.join(env.LM_DIR, "stamps")
+        env.LM_MAKEFILE = os.path.join(env.LM_DIR, "Makefile")
+
+        if not os.path.exists(env.LM_STAMPDIR):
+            os.mkdir(env.LM_STAMPDIR)
+
+        env.LM_REDO_FN = os.path.join(env.LM_STAMPDIR, ".redo")
+        env.LM_REBOOT_FN = os.path.join(env.LM_STAMPDIR, ".reboot")
+
+        env.HOSTNAME = sh("hostname")
+        env.DOMAIN = '.'.join(env.HOSTNAME.split('.')[1:])
+
+        env.LM_VPATH_FN = os.path.join(env.LM_STAMPDIR, ".vpath")
+        make(["-B"], ['vpath'])
+        vpath = open(env.LM_VPATH_FN, 'r').read().split()
+        logging.debug(vpath)
+
+        # - vpath is ordered from most specific to most general (first one wins)
+        env.LM_VPATH = ' '.join(vpath)
+        # - stow needs the opposite (last one wins)
+        env.LM_VPATH_REV = ' '.join(reversed(vpath))
+
+        # subprocess.run("env")
+
+        # run 'make'
+        touchall(env.LM_STAMPDIR)
+        makeargs = conf.makeargs(vpath, args.targets)
+        makeflags = args.noop and ["-n"] or [""]
+        makeflags.extend(shlex.split("-C %s -f %s" % (env.LM_STAMPDIR, env.LM_MAKEFILE)))
+        make(makeflags, makeargs)
+
+        # check semaphore files
+        if os.path.exists(env.LM_REDO_FN):
+            os.unlink(env.LM_REDO_FN)
+            continue
+        if os.path.exists(env.LM_REBOOT_FN):
+            os.unlink(env.LM_REBOOT_FN)
+            make(["-B"], ['reboot'])
+
+        break
+
+def make(flags, targets):
+    cmd = ['make'] + flags + targets
+    logging.info(' '.join(cmd))
+    subprocess.run(cmd, check=True)
+
+def sh(cmd):
+    if type(cmd) == str:
+        cmd = shlex.split(cmd)
+    out = subprocess.check_output(cmd)
+    out = out.decode().strip()
+    return out
+
+def touchall(dirname):
+    '''
+    prevent make from acting like make -- we don't want it to try to rebuild "old" targets
+    '''
+    now = time.time()
+    for fn in filter(lambda fn: not fn.startswith("."), os.listdir(dirname)):
+        touch(now, os.path.join(dirname, fn))
+
+def touch(now, fn):
+    os.utime(fn, times=(now, now))
+
+class Env(dict):
+    def __setattr__(self, var, val):
+        self[var] = val
+        self.__dict__[var] = val
+        os.environ[var] = val
+
+class Config(collections.OrderedDict):
+
+    def __init__(self, files):
+        for fn in files:
+            fh = open(fn, 'r')
+            self.parse(fh)
+
+    def default(self):
+        key = list(self.keys())[0]
+        return self[key]
+
+    def parse(self, fh):
+
+        # temporarily load rhs of each stanza into a string
+        key = None
+        for line in fh.readlines():
+            line = line.rstrip()
+
+            # comment lines start with '#'
+            if re.match('^\s*#', line):
+                continue
+
+            # stanzas start in column 0
+            m = re.match('^(\S+):(.*)', line)
+            if m:
+                key = m.group(1)
+                assert key not in self.keys()
+                self[key] = m.group(2)
+                continue
+
+            # continuations are indented
+            m = re.match('^\s+(.*?)$', line)
+            if m:
+                self[key] += " %s" % m.group(1)
+                continue
+
+        # replace temporary strings with parsed tuples
+        for key, rhs in self.items():
+            tuples = collections.OrderedDict()
+            for token in shlex.split(rhs):
+                m = re.match('^(\w+)=(.*)', token)
+                if not m:
+                    # token is a word -- use None to indicate that
+                    var = token
+                    val = None
+                else:
+                    var = m.group(1)
+                    val = m.group(2)
+                assert var not in tuples.keys(), (key, var, val, rhs)
+                tuples[var] = val
+            self[key] = tuples
+
+        # expand macros by using ChainMap
+        for key, tuples in self.items():
+            maps = [tuples]
+            for var, val in tuples.items():
+                if val is None:
+                    maps.append(self[var])
+            self[key] = collections.ChainMap(*maps)
+
+    def vconf(self, vpath):
+        ''' build a customized tuple set for this host '''
+        maps = [ self[key] for key in vpath ] 
+        logging.debug(pprint.pformat(maps))
+        vconf = collections.ChainMap(*maps)
+        return vconf
+
+    def expand_targets(self, vpath, targets):
+        '''
+        Given a list of targets, expand any that are tuple names
+        names by replacing them with their tuple values.
+
+        '''
+        vconf = self.vconf(vpath)
+        # logging.info(pprint.pformat(vconf['NETMASK']))
+        # logging.info(pprint.pformat(vconf['FOO']))
+        # logging.info(pprint.pformat(vconf['BOOT']))
+        # logging.info(pprint.pformat(vconf['NAMESERVER']))
+
+        out = []
+        for target in targets:
+            val = vconf.get(target)
+            if val is None:
+                # target is a make target; pass it through 
+                out.append(target)
+            else:
+                # target is an env var name; replace with val
+                # XXX we could recurse here, but have never needed it
+                out.extend(shlex.split(val))
+        return out
+
+
+
+    def makeargs(self, vpath, targets):
+        out = []
+        for key, val in self.vconf(vpath).items():
+            out.append("%s=%s" % (key, shlex.quote(val)))
+        out += self.expand_targets(vpath, targets)
+        return out
+
+
+if __name__ == "__main__":
+    main()
