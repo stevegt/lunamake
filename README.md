@@ -1,5 +1,6 @@
+# LunaMake
 
-# Configure
+## Configure
 
 git clone repo 
 cd lunamake
@@ -12,13 +13,12 @@ git add .
 git commit
 git push --all
 
-# Install
+## Install
 
 git clone repo /var/lunamake
 cd /var/lunamake
 git checkout local
 
-# Run
+## Run
 
 /var/lunamake/lunamake BOOT  # e.g.
-
