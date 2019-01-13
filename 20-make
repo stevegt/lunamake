@@ -1,0 +1,63 @@
+#!/usr/bin/python3
+
+import argparse
+import collections
+import logging
+import os
+import pprint
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+from lmutil import Env, sh
+
+def main():
+
+    env = Env()
+    assert env.LM_NOOP in ('true', 'false')
+
+    # set up logging
+    log_level = getattr(logging, env.LM_LOGLEVEL, None)
+    logging.basicConfig(level=log_level)
+     
+    # expand make targets from env vars of same name
+    make_targets = expand_targets(shlex.split(env.LM_TARGETS))
+    logging.info(make_targets)
+
+    # run 'make'
+    touchall(env.LM_STAMPDIR)
+    makeflags = env.LM_NOOP == 'true' and ["-n"] or [""]
+    makeflags.extend(shlex.split("-C %s -f %s" % (env.LM_STAMPDIR, env.LM_MAKEFILE)))
+    make(makeflags, make_targets)
+
+def touchall(dirname):
+    '''
+    prevent make from acting like make -- we don't want it to try to rebuild "old" targets
+    '''
+    now = time.time()
+    for fn in filter(lambda fn: not fn.startswith("."), os.listdir(dirname)):
+        touch(now, os.path.join(dirname, fn))
+
+def touch(now, fn):
+    os.utime(fn, times=(now, now))
+
+def expand_targets(targets):
+    '''
+    Given a list of targets, expand any that are env variable names by
+    replacing them with their env variable values.
+    '''
+    out = []
+    for target in targets:
+        val = os.environ.get(target)
+        if val is None:
+            # target is a make target; pass it through 
+            out.append(target)
+        else:
+            # target is an env var name; replace with val
+            out.extend(shlex.split(val))
+    return out
+
+if __name__ == "__main__":
+    main()
