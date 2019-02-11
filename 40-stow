@@ -40,7 +40,7 @@ fns = set(fns)
 # run stow
 flags = env.LM_NOOP == 'true' and ["-n"] or [""]
 stowdir = os.path.join(env.LM_DIR, "stow")
-sh('stow %s -d %s -t / --adopt --override=. -vS "%s"' % (
+sh('stow %s -d %s -t / --adopt --override=. -vS %s' % (
     flags, stowdir, env.LM_VPATH_REV))
 
 # run triggers
