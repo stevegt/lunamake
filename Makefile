@@ -4,16 +4,21 @@ all:
 	@echo usage: lunamake CONTEXT
 	exit 126
 
-vpath:
-	echo `hostname` TOS > $(LM_VPATH_FN)
-
 reboot:
 	halt
 	sleep 999999
 
-Block00: pull stow
+Block00: pull 
 
-Gold00: pull stow
+Gold00: pull 
+
+Swarm00: pull 
+
+pull:
+	echo XXX
+
+stow:
+	echo XXX
 
 
 

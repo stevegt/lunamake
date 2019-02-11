@@ -5,10 +5,10 @@
 git clone repo_from_github
 cd lunamake
 git checkout -b some_local_name  # suggest e.g. prod.example.com
-vi main.conf # and localize it
-vi Makefile # and localize it
-mkdir stow # and populate it 
-vi triggers # and localize 
+vi main.conf # localize 
+vi Makefile # localize 
+mkdir stow # populate  
+vi triggers # localize 
 git add .
 git commit
 git push --all local_server

@@ -11,11 +11,24 @@ import subprocess
 import sys
 import time
 
+class Env(dict):
+
+    def __setattr__(self, var, val):
+        self[var] = val
+        self.__dict__[var] = val
+        os.environ[var] = val
+
 def main():
 
+    # XXX move everything into numbered scripts, re-read a .env file after every script execution
+
+    hostname = sh("hostname")
+
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-C", '--directory', metavar="DIRECTORY", 
+    parser.add_argument("-C", '--confdir', metavar="DIRECTORY", 
             help="directory containing lunamake configuration files (default current)")
+    parser.add_argument("-H", '--hostname', metavar="HOSTNAME", default=hostname,
+            help="name of local host; to be matched with patterns in config file(s)")
     parser.add_argument("-l", '--log', metavar="LOG_LEVEL", default="INFO",
             help="log level name as defined in python logging module")
     parser.add_argument("-n", '--noop', action="store_true",
@@ -23,69 +36,55 @@ def main():
     parser.add_argument('targets', metavar="TARGETS", nargs='*')
     args = parser.parse_args()
 
-    # change to config directory
-    if args.directory:
-        os.chdir(args.directory)
-
+    # set up logging
     log_level = getattr(logging, args.log.upper(), None)
     logging.basicConfig(level=log_level)
+        
+    # change to config directory
+    if args.confdir:
+        os.chdir(args.confdir)
 
-    while True:
+    # set environment vars
+    env = Env()
+    env.LM_DIR = os.path.abspath('.')
+    env.LM_STAMPDIR = os.path.join(env.LM_DIR, "stamps")
+    env.LM_MAKEFILE = os.path.join(env.LM_DIR, "Makefile")
+    env.LM_HOSTNAME = args.hostname
+    env.LM_REBOOT_FN = os.path.join(env.LM_STAMPDIR, ".reboot")
 
-        # parse .conf file(s) 
-        files = sorted(filter(lambda fn: fn.endswith(".conf"), os.listdir()))
-        conf = Config(files)
-        logging.debug(pprint.pformat(conf))
-        # default = conf.default()
+    if not os.path.exists(env.LM_STAMPDIR):
+        os.mkdir(env.LM_STAMPDIR)
 
-        # set environment vars
-        env = Env()
-        env.LM_DIR = os.path.abspath('.')
-        env.LM_STAMPDIR = os.path.join(env.LM_DIR, "stamps")
-        env.LM_MAKEFILE = os.path.join(env.LM_DIR, "Makefile")
+    # call external prog and read stdout to set more env vars
+    envstr = sh('./pre')
+    for line in envstr.splitlines():
+        var, val = line.split('=', maxsplit=1)
+        os.environ[var] = val
+        logging.info(line)
 
-        if not os.path.exists(env.LM_STAMPDIR):
-            os.mkdir(env.LM_STAMPDIR)
+    # expand make targets from env vars of same name
+    make_targets = expand_targets(args.targets)
+    logging.info(make_targets)
 
-        env.LM_REDO_FN = os.path.join(env.LM_STAMPDIR, ".redo")
-        env.LM_REBOOT_FN = os.path.join(env.LM_STAMPDIR, ".reboot")
+    # run 'make'
+    touchall(env.LM_STAMPDIR)
+    makeflags = args.noop and ["-n"] or [""]
+    makeflags.extend(shlex.split("-C %s -f %s" % (env.LM_STAMPDIR, env.LM_MAKEFILE)))
+    make(makeflags, make_targets)
 
-        env.HOSTNAME = sh("hostname")
-        env.DOMAIN = '.'.join(env.HOSTNAME.split('.')[1:])
+    # run stow and triggers
+    sh('./post')
 
-        env.LM_VPATH_FN = os.path.join(env.LM_STAMPDIR, ".vpath")
-        make(["-B"], ['vpath'])
-        vpath = open(env.LM_VPATH_FN, 'r').read().split()
-        logging.debug(vpath)
-
-        # - vpath is ordered from most specific to most general (first one wins)
-        env.LM_VPATH = ' '.join(vpath)
-        # - stow needs the opposite (last one wins)
-        env.LM_VPATH_REV = ' '.join(reversed(vpath))
-
-        # subprocess.run("env")
-
-        # run 'make'
-        touchall(env.LM_STAMPDIR)
-        makeargs = conf.makeargs(vpath, args.targets)
-        makeflags = args.noop and ["-n"] or [""]
-        makeflags.extend(shlex.split("-C %s -f %s" % (env.LM_STAMPDIR, env.LM_MAKEFILE)))
-        make(makeflags, makeargs)
-
-        # check semaphore files
-        if os.path.exists(env.LM_REDO_FN):
-            os.unlink(env.LM_REDO_FN)
-            continue
-        if os.path.exists(env.LM_REBOOT_FN):
-            os.unlink(env.LM_REBOOT_FN)
-            make(["-B"], ['reboot'])
-
-        break
+    # check reboot semaphore file
+    if os.path.exists(env.LM_REBOOT_FN):
+        os.unlink(env.LM_REBOOT_FN)
+        make(["-B"], ['reboot'])
 
 def make(flags, targets):
     cmd = ['make'] + flags + targets
-    logging.info(' '.join(cmd))
-    subprocess.run(cmd, check=True)
+    cmd = ' '.join(cmd)
+    logging.info(cmd)
+    subprocess.run(cmd, shell=True, check=True)
 
 def sh(cmd):
     if type(cmd) == str:
@@ -105,112 +104,21 @@ def touchall(dirname):
 def touch(now, fn):
     os.utime(fn, times=(now, now))
 
-class Env(dict):
-    def __setattr__(self, var, val):
-        self[var] = val
-        self.__dict__[var] = val
-        os.environ[var] = val
-
-class Config(collections.OrderedDict):
-
-    def __init__(self, files):
-        for fn in files:
-            fh = open(fn, 'r')
-            self.parse(fh)
-
-    def default(self):
-        key = list(self.keys())[0]
-        return self[key]
-
-    def parse(self, fh):
-
-        # temporarily load rhs of each stanza into a string
-        key = None
-        for line in fh.readlines():
-            line = line.rstrip()
-
-            # comment lines start with '#'
-            if re.match('^\s*#', line):
-                continue
-
-            # stanzas start in column 0
-            m = re.match('^(\S+):(.*)', line)
-            if m:
-                key = m.group(1)
-                assert key not in self.keys()
-                self[key] = m.group(2)
-                continue
-
-            # continuations are indented
-            m = re.match('^\s+(.*?)$', line)
-            if m:
-                self[key] += " %s" % m.group(1)
-                continue
-
-        # replace temporary strings with parsed tuples
-        for key, rhs in self.items():
-            tuples = collections.OrderedDict()
-            for token in shlex.split(rhs):
-                m = re.match('^(\w+)=(.*)', token)
-                if not m:
-                    # token is a word -- use None to indicate that
-                    var = token
-                    val = None
-                else:
-                    var = m.group(1)
-                    val = m.group(2)
-                assert var not in tuples.keys(), (key, var, val, rhs)
-                tuples[var] = val
-            self[key] = tuples
-
-        # expand macros by using ChainMap
-        for key, tuples in self.items():
-            maps = [tuples]
-            for var, val in tuples.items():
-                if val is None:
-                    maps.append(self[var])
-            self[key] = collections.ChainMap(*maps)
-
-    def vconf(self, vpath):
-        ''' build a customized tuple set for this host '''
-        maps = [ self[key] for key in vpath ] 
-        logging.debug(pprint.pformat(maps))
-        vconf = collections.ChainMap(*maps)
-        return vconf
-
-    def expand_targets(self, vpath, targets):
-        '''
-        Given a list of targets, expand any that are tuple names
-        names by replacing them with their tuple values.
-
-        '''
-        vconf = self.vconf(vpath)
-        # logging.info(pprint.pformat(vconf['NETMASK']))
-        # logging.info(pprint.pformat(vconf['FOO']))
-        # logging.info(pprint.pformat(vconf['BOOT']))
-        # logging.info(pprint.pformat(vconf['NAMESERVER']))
-
-        out = []
-        for target in targets:
-            val = vconf.get(target)
-            if val is None:
-                # target is a make target; pass it through 
-                out.append(target)
-            else:
-                # target is an env var name; replace with val
-                # XXX we could recurse here, but have never needed it
-                out.extend(shlex.split(val))
-        return out
-
-
-
-    def makeargs(self, vpath, targets):
-        out = []
-        for key, val in self.vconf(vpath).items():
-            out.append("%s=%s" % (key, shlex.quote(val)))
-        out += self.expand_targets(vpath, targets)
-        return out
-
+def expand_targets(targets):
+    '''
+    Given a list of targets, expand any that are env variable names by
+    replacing them with their env variable values.
+    '''
+    out = []
+    for target in targets:
+        val = os.environ.get(target)
+        if val is None:
+            # target is a make target; pass it through 
+            out.append(target)
+        else:
+            # target is an env var name; replace with val
+            out.extend(shlex.split(val))
+    return out
 
 if __name__ == "__main__":
     main()
