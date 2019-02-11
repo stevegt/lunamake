@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+
+import os
+import re
+import subprocess
+
+from lmutil import Env, sh, shlex_join
+
+env = Env()
+assert env.LM_NOOP in ('true', 'false')
+
+# Find out which trigger files changed since the last time we ran.
+#
+# Get the git commit id as of last time we ran.  If we've never run
+# before, then go back 40 years. (As of git 2.15.1, the max appears to
+# be about 49.9, and git exits silently at 50, so we're being
+# conservative here and picking 40.)
+# 
+# XXX This will fail to trigger on new hosts in an old infrastructure 
+# if a config file has not changed in VCS for over 40 years.  If you hit
+# this, then the workaround is to make a nonfunctional change and
+# re-commit the file.
+#
+# XXX is there any reason why we can't just use a timestamp file
+# instead of asking git? 
+previdfn = os.path.join(env.LM_DIR, "local/prev_commit_id")
+os.path.exists(previdfn) or open(previdfn, 'w').write('HEAD@{40 year ago}\n')
+previd = open(previdfn, 'r').read().strip()
+
+# Find out which files changed by diffing between now and the last
+# commit id.
+diffcmd = 'git diff --name-only --diff-filter=AM "%s..HEAD"' % previd
+diffout = subprocess.Popen(diffcmd, shell=True, stdout=subprocess.PIPE).stdout
+fns = diffout.readlines()
+# remove leading stowdir
+fns = map(lambda fn: re.sub("^%s/" % stowdir, "/", fn), fns)
+# uniq
+fns = set(fns)
+
+# run stow
+flags = env.LM_NOOP == 'true' and ["-n"] or [""]
+stowdir = os.path.join(env.LM_DIR, "stow")
+sh('stow %s -d %s -t / --adopt --override=. -vS "%s"' % (
+    flags, stowdir, env.LM_VPATH_REV))
+
+# run triggers
+triggersfn = os.path.join(env.LM_DIR, "triggers")
+for fn in fns:
+    for pattern, trig_cmd in open(triggersfn, 'r').readlines():
+        if re.match(pattern, fn):
+            if env.LM_NOOP == 'true':
+                # XXX logging or stderr?
+                print("would run:", shlex_join([trig_cmd, fn]))
+            else:
+                sh([trig_cmd, fn])
+
+# store git commit id for next time
+if env.LM_NOOP != 'true':
+    sh("git rev-parse HEAD > %s" % previdfn)
