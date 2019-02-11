@@ -88,7 +88,7 @@ def main():
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-C", '--confdir', metavar="DIRECTORY", default='/var/lunamake',
-            help="directory containing lunamake configuration files")
+            help="lunamake git repository")
     parser.add_argument("-H", '--hostname', metavar="HOSTNAME", default=hostname,
             help="local hostname")
     parser.add_argument("-l", '--log', metavar="LOG_LEVEL", default="INFO",
